@@ -1,3 +1,9 @@
+////////////////////////////////////////////////////////////////////////////////////////
+// Beispiel_001
+// In Zeile 16 können Sie jeden beliebig großen Eingabe-String eingeben.
+// Der Eingabe-String wird damit in SHA256 und HASH160 gehasht
+////////////////////////////////////////////////////////////////////////////////////////
+
 using NBitcoin;
 using NBitcoin.DataEncoders;
 using System;
@@ -14,7 +20,6 @@ class Beispiel_001
         // SHA256(data)
         var sha256 = NBitcoin.Crypto.Hashes.SHA256(data);
 
-        // RIPEMD160(SHA256(data)) == Hash160(data)
         var hash160Bytes = NBitcoin.Crypto.Hashes.Hash160(data).ToBytes();
 
         Console.WriteLine("===== Hashing von Daten =====");
