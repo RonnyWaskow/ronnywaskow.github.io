@@ -1,0 +1,43 @@
+using NBitcoin;
+using NBitcoin.DataEncoders;
+using System;
+using System.Text;
+
+class Praxis2_4
+{
+    static void Main()
+    {
+        var network = Network.Main;
+
+        var data = Encoding.UTF8.GetBytes("Hello Bitcoin");
+
+        // SHA256(data)
+        var sha256 = NBitcoin.Crypto.Hashes.SHA256(data);
+
+        // RIPEMD160(SHA256(data)) == Hash160(data)
+        var hash160Bytes = NBitcoin.Crypto.Hashes.Hash160(data).ToBytes();
+
+        Console.WriteLine("===== Hashing von Daten =====");
+        Console.WriteLine("Eingabe:       Hello Bitcoin");
+        Console.WriteLine($"SHA256(data):  {Encoders.Hex.EncodeData(sha256)}");
+        Console.WriteLine($"HASH160(data): {Encoders.Hex.EncodeData(hash160Bytes)}");
+        Console.WriteLine();
+
+        var privateKey = new Key();
+        Console.WriteLine("=== Private/Public Key ===");
+        Console.WriteLine($"Privater Schlüssel (WIF): {privateKey.GetWif(network)}");
+
+        var publicKey = privateKey.PubKey;
+        Console.WriteLine($"Öffentlicher Schlüssel:   {publicKey}");
+        Console.WriteLine();
+
+        var legacyAddress = publicKey.GetAddress(ScriptPubKeyType.Legacy, network);
+        var segwitAddress = publicKey.GetAddress(ScriptPubKeyType.Segwit, network);
+
+        Console.WriteLine("=== Adressformate ===");
+        Console.WriteLine($"Legacy (P2PKH):   {legacyAddress}");
+        Console.WriteLine($"SegWit (P2WPKH):  {segwitAddress}");
+
+        Console.ReadKey();
+    }
+}
