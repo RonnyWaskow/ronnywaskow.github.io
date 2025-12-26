@@ -3,7 +3,7 @@ using NBitcoin.DataEncoders;
 using System;
 using System.Text;
 
-class Praxis2_4
+class Beispiel_001
 {
     static void Main()
     {
