@@ -6,7 +6,6 @@ class Program
 {
     static void Main()
     {
-        // Kurze Erklärung ganz oben in der Konsole (DE + EN) inkl. Autor-Verweis
         Console.ForegroundColor = ConsoleColor.DarkYellow;
         Console.WriteLine("=== Erklärung (DE) ===");
         Console.WriteLine("Dieses Programm erzeugt eine zufällige 12-Wort-BIP39-Mnemonic, leitet daraus per BIP84 (m/84'/0'/0'/0/0) ");
