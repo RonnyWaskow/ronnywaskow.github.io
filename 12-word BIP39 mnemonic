@@ -1,0 +1,55 @@
+using NBitcoin;
+using System;
+using System.Net;
+
+class Program
+{
+    static void Main()
+    {
+        // Kurze Erklärung ganz oben in der Konsole (DE + EN) inkl. Autor-Verweis
+        Console.ForegroundColor = ConsoleColor.DarkYellow;
+        Console.WriteLine("=== Erklärung (DE) ===");
+        Console.WriteLine("Dieses Programm erzeugt eine zufällige 12-Wort-BIP39-Mnemonic, leitet daraus per BIP84 (m/84'/0'/0'/0/0) ");
+        Console.WriteLine("einen Bitcoin-Mainnet-Schlüssel ab und gibt Mnemonic sowie die zugehörige Native-SegWit-Adresse (bc1q / P2WPKH) aus.");
+        Console.WriteLine();
+        Console.WriteLine("=== Explanation (EN) ===");
+        Console.WriteLine("This program generates a random 12-word BIP39 mnemonic, derives a Bitcoin Mainnet key via BIP84 (m/84'/0'/0'/0/0) ");
+        Console.WriteLine("and prints the mnemonic and the corresponding native SegWit address (bc1q / P2WPKH).");
+        Console.WriteLine();
+        Console.WriteLine("Autor/Author: Ronny Waskow");
+        Console.WriteLine(new string('-', 90));
+        Console.ResetColor();
+        Console.WriteLine();
+
+        // 1) Zufällige 12-Wort Mnemonic (128-bit Entropy)
+        var mnemonic = new Mnemonic(Wordlist.English, WordCount.Twelve);
+
+        string passphrase = "";
+
+        // 2) Seed -> Master Key
+        ExtKey masterKey = mnemonic.DeriveExtKey(passphrase);
+
+        // 3) BIP84 Pfad für Bitcoin Mainnet: m/84'/0'/0'/0/0
+        var path = new KeyPath("84'/0'/0'/0/0");
+        ExtKey accountKey = masterKey.Derive(path);
+
+        // 4) Native SegWit (P2WPKH) bc1q-Adresse
+        var address = accountKey.PrivateKey
+            .PubKey
+            .GetAddress(ScriptPubKeyType.Segwit, Network.Main);
+
+        Console.ForegroundColor = ConsoleColor.DarkRed;
+        Console.WriteLine("Mnemonic (12 Wörter):");
+        Console.WriteLine("---------------------");
+        Console.ForegroundColor = ConsoleColor.Gray;
+        Console.WriteLine(mnemonic);
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.DarkRed;
+        Console.WriteLine("Adresse (bc1q, P2WPKH):");
+        Console.WriteLine("-----------------------");
+        Console.ForegroundColor = ConsoleColor.Gray;
+        Console.WriteLine(address);
+
+        Console.ReadKey();
+    }
+}
