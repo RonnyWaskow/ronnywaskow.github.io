@@ -1,0 +1,669 @@
+// Program.cs (.NET 8) - Stratum V1 Bitcoin CPU Miner
+
+
+using System;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net.Sockets;
+using System.Numerics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+
+static class Hex
+{
+    public static byte[] ToBytes(string hex)
+    {
+        if (hex is null) throw new ArgumentNullException(nameof(hex));
+        hex = new string(hex.Where(c => !char.IsWhiteSpace(c)).ToArray());
+        if (hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) hex = hex[2..];
+        if ((hex.Length & 1) == 1) throw new ArgumentException("Hex length must be even.");
+        var bytes = new byte[hex.Length / 2];
+        for (int i = 0; i < bytes.Length; i++)
+            bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+        return bytes;
+    }
+
+    public static string FromBytes(ReadOnlySpan<byte> b)
+    {
+        char[] c = new char[b.Length * 2];
+        int k = 0;
+        for (int i = 0; i < b.Length; i++)
+        {
+            byte v = b[i];
+            c[k++] = GetHex(v >> 4);
+            c[k++] = GetHex(v & 0xF);
+        }
+        return new string(c);
+        static char GetHex(int x) => (char)(x < 10 ? ('0' + x) : ('a' + (x - 10)));
+    }
+
+    // Swap bytes within each 4-byte word: ABCD -> DCBA, repeated for 32 bytes.
+    public static void Swap32Words(ReadOnlySpan<byte> src32, Span<byte> dst32)
+    {
+        if (src32.Length != 32 || dst32.Length != 32) throw new ArgumentException("need 32 bytes");
+        for (int i = 0; i < 32; i += 4)
+        {
+            dst32[i + 0] = src32[i + 3];
+            dst32[i + 1] = src32[i + 2];
+            dst32[i + 2] = src32[i + 1];
+            dst32[i + 3] = src32[i + 0];
+        }
+    }
+}
+
+static class BtcHash
+{
+    [ThreadStatic] private static SHA256? _sha;
+    private static SHA256 Sha => _sha ??= SHA256.Create();
+
+    public static void DoubleSha256(ReadOnlySpan<byte> data, Span<byte> out32)
+    {
+        Span<byte> h1 = stackalloc byte[32];
+        _ = Sha.TryComputeHash(data, h1, out _);
+        _ = Sha.TryComputeHash(h1, out32, out _);
+    }
+}
+
+static class OfflineTests
+{
+    private const string Expected100k =
+        "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506";
+
+    private const string Header100kHex =
+        "0100000050120119172a610421a6c3011dd330d9df07b63616c2cc1f1cd00200000000006657a9252aacd5c0b2940996ecff952228c3067cc38d4885efb5a4ac4247e9f337221b4d4c86041b0f2b5710";
+
+    public static bool KnownBlock100k()
+    {
+        Console.WriteLine("=== OFFLINE TESTS (.NET 8) ===\n");
+        Console.WriteLine("[1] Known-Block-Test (Block 100000)");
+
+        byte[] header = Hex.ToBytes(Header100kHex);
+        if (header.Length != 80) throw new Exception("Header100k is not 80 bytes.");
+
+        Span<byte> digest = stackalloc byte[32];
+        BtcHash.DoubleSha256(header, digest);
+
+        Span<byte> disp = stackalloc byte[32];
+        digest.CopyTo(disp);
+        disp.Reverse();
+
+        string got = Hex.FromBytes(disp);
+
+        Console.WriteLine("Berechneter Hash:");
+        Console.WriteLine(got);
+        Console.WriteLine("\nErwartet:");
+        Console.WriteLine(Expected100k);
+
+        bool ok = string.Equals(got, Expected100k, StringComparison.OrdinalIgnoreCase);
+        Console.WriteLine(ok ? "\n✅ TEST OK" : "\n❌ TEST FEHLGESCHLAGEN");
+        return ok;
+    }
+}
+
+sealed class MiningJob
+{
+    public string JobId = "";
+    public string NTimeHex = "";
+    public uint VersionU32;
+    public uint NBitsU32;
+    public uint NTimeU32;
+
+    public byte[] PrevHeader32 = new byte[32];     // Swap32Words(prevhash)
+    public byte[] Coinbase1Bytes = Array.Empty<byte>();
+    public byte[] Coinbase2Bytes = Array.Empty<byte>();
+    public byte[][] MerkleBranches = Array.Empty<byte[]>(); // each 32, AS-IS
+}
+
+readonly record struct SubmitItem(long RpcId, string JobId, string En2Hex, string NTimeHex, string NonceHex, string HashDisp);
+
+sealed class StratumMiner
+{
+    private TcpClient? _client;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+    private readonly object _sendLock = new();
+
+    private string _extranonce1Hex = "";
+    private byte[] _extranonce1Bytes = Array.Empty<byte>();
+    private int _extranonce2Size = 0;
+
+    private volatile MiningJob? _job;
+    private CancellationTokenSource? _mineCts;
+
+    private long _extranonce2Counter = 0;
+    private long _rpcId = 10;
+
+    private decimal _poolDiff = 1m;
+
+    private volatile byte[] _targetLE = MaxTargetLE();
+    private volatile string _targetBEHex = MaxTargetBEHex();
+
+    private long[] _threadCounts = Array.Empty<long>();
+    private long _lastTotal = 0;
+    private DateTime _lastPrint = DateTime.UtcNow;
+
+    private Channel<SubmitItem>? _submitQ;
+    private long _accepted = 0;
+    private long _rejected = 0;
+
+    public string WorkerName { get; private set; } = "";
+
+    private static readonly BigInteger Diff1Target =
+        BigInteger.Parse("00000000FFFF0000000000000000000000000000000000000000000000000000",
+            NumberStyles.AllowHexSpecifier);
+
+    public void Connect(string host, int port, string worker, string password)
+    {
+        WorkerName = worker;
+
+        _client = new TcpClient { NoDelay = true };
+        _client.Connect(host, port);
+
+        var stream = _client.GetStream();
+        _reader = new StreamReader(stream, new UTF8Encoding(false));
+        _writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"Verbunden mit Pool: {host}  Port: {port}");
+        Console.ForegroundColor = ConsoleColor.White;
+
+        Send(JsonSerializer.Serialize(new { id = 1, method = "mining.subscribe", @params = new object[] { "DotNetNERD/1.1" } }));
+        Send(JsonSerializer.Serialize(new { id = 2, method = "mining.authorize", @params = new object[] { worker, password } }));
+    }
+
+    private void Send(string json)
+    {
+        lock (_sendLock)
+        {
+            _writer!.WriteLine(json);
+        }
+        // optional: comment out for max speed
+        // Console.WriteLine(">>> " + json);
+    }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        if (_reader == null) throw new InvalidOperationException("Not connected.");
+
+        _ = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                PrintHashrate();
+                try { await Task.Delay(2000, ct); } catch { }
+            }
+        }, ct);
+
+        while (!ct.IsCancellationRequested)
+        {
+            string? line;
+            try { line = await _reader.ReadLineAsync().WaitAsync(ct); }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                Console.WriteLine("ReadLoop error: " + ex.Message);
+                break;
+            }
+
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            Console.WriteLine("<<< " + line);
+
+            JsonNode? root;
+            try { root = JsonNode.Parse(line); }
+            catch { continue; }
+            if (root == null) continue;
+
+            int? id = TryGetInt(root["id"]);
+            string? method = TryGetString(root["method"]);
+
+            if (id == 1)
+            {
+                var res = root["result"]?.AsArray();
+                _extranonce1Hex = res?[1]?.GetValue<string>() ?? "";
+                _extranonce2Size = res?[2]?.GetValue<int>() ?? 0;
+                _extranonce1Bytes = string.IsNullOrEmpty(_extranonce1Hex) ? Array.Empty<byte>() : Hex.ToBytes(_extranonce1Hex);
+
+                Console.WriteLine($"Subscribe OK - extranonce1={_extranonce1Hex} (en2Size={_extranonce2Size})");
+                continue;
+            }
+
+            if (id == 2)
+            {
+                Console.WriteLine("Authorize OK");
+                continue;
+            }
+
+            // submit response: match any id >= 11
+            if (id != null && id >= 11 && method == null)
+            {
+                var errNode = root["error"];
+
+                bool errIsNull =
+                    errNode == null ||
+                    (errNode is JsonValue ev && ev.TryGetValue<object?>(out var o) && o == null) ||
+                    (errNode is JsonNode en && en.ToJsonString() == "null");
+
+                if (errIsNull)
+                {
+                    Interlocked.Increment(ref _accepted);
+                    Console.WriteLine($"✅ SHARE ACCEPTED (acc={_accepted} rej={_rejected})");
+                }
+                else
+                {
+                    Interlocked.Increment(ref _rejected);
+
+                    if (errNode is JsonArray ea && ea.Count >= 2)
+                    {
+                        int code = 0; string msg = "";
+                        try { code = ea[0]!.GetValue<int>(); } catch { }
+                        try { msg = ea[1]!.GetValue<string>(); } catch { }
+                        Console.WriteLine($"❌ SHARE REJECTED: [{code}] {msg}  (acc={_accepted} rej={_rejected})");
+                    }
+                    else Console.WriteLine($"❌ SHARE REJECTED: {errNode?.ToJsonString()}  (acc={_accepted} rej={_rejected})");
+                }
+                continue;
+            }
+
+            if (method == "mining.set_difficulty")
+            {
+                var p = root["params"]?.AsArray();
+                var tok = p != null && p.Count > 0 ? p[0] : null;
+
+                _poolDiff = ParseDecimalLoose(tok);
+
+                var target = TargetFromDifficulty(_poolDiff);
+                _targetLE = TargetToLE32(target);
+                _targetBEHex = TargetToBEHex32(target);
+
+                Console.WriteLine($"Difficulty gesetzt: {_poolDiff.ToString(CultureInfo.InvariantCulture)}");
+                Console.WriteLine($"Target(pool) = {_targetBEHex}");
+
+                RestartMiningIfRunning();
+                continue;
+            }
+
+            if (method == "mining.notify")
+            {
+                var p = root["params"]?.AsArray();
+                if (p == null || p.Count < 9) continue;
+
+                var branchesArr = p[4]?.AsArray();
+
+                var job = new MiningJob();
+                job.JobId = p[0]!.GetValue<string>();
+                string prevHex = p[1]!.GetValue<string>();
+                string cb1Hex = p[2]!.GetValue<string>();
+                string cb2Hex = p[3]!.GetValue<string>();
+                job.VersionU32 = ParseUInt32Hex(p[5]!.GetValue<string>());
+                job.NBitsU32 = ParseUInt32Hex(p[6]!.GetValue<string>());
+                job.NTimeHex = p[7]!.GetValue<string>();
+                job.NTimeU32 = ParseUInt32Hex(job.NTimeHex);
+
+                var prevBytes = Hex.ToBytes(prevHex);
+                Hex.Swap32Words(prevBytes, job.PrevHeader32);
+
+                job.Coinbase1Bytes = Hex.ToBytes(cb1Hex);
+                job.Coinbase2Bytes = Hex.ToBytes(cb2Hex);
+
+                if (branchesArr != null)
+                {
+                    job.MerkleBranches = branchesArr.Select(x => Hex.ToBytes(x!.GetValue<string>())).ToArray();
+                }
+
+                bool clean = p[8]!.GetValue<bool>();
+                _job = job;
+
+                Console.WriteLine(clean
+                    ? "notify clean_jobs=true -> Neustart (NERD-COMPAT)"
+                    : "notify clean_jobs=false -> Neustart (NERD-COMPAT)");
+
+                StartMining();
+                continue;
+            }
+        }
+    }
+
+    private void StartMining()
+    {
+        _mineCts?.Cancel();
+        _mineCts = new CancellationTokenSource();
+
+        int threads = Environment.ProcessorCount;
+        _threadCounts = new long[threads];
+        _lastTotal = 0;
+        _lastPrint = DateTime.UtcNow;
+
+        _submitQ = Channel.CreateUnbounded<SubmitItem>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = true
+        });
+
+        Task.Run(() => SubmitLoop(_mineCts.Token), _mineCts.Token);
+
+        Console.WriteLine($"Starte Mining auf {threads} Threads (NERD-COMPAT)");
+
+        for (int i = 0; i < threads; i++)
+        {
+            int tid = i;
+            var t = new Thread(() => MineThread(tid, threads, _mineCts.Token))
+            {
+                IsBackground = true,
+                Priority = ThreadPriority.Highest,
+                Name = $"mine-{tid}"
+            };
+            t.Start();
+        }
+    }
+
+    private async Task SubmitLoop(CancellationToken ct)
+    {
+        if (_submitQ == null) return;
+        var r = _submitQ.Reader;
+
+        while (!ct.IsCancellationRequested)
+        {
+            SubmitItem item;
+            try { item = await r.ReadAsync(ct); }
+            catch { break; }
+
+            var msg = JsonSerializer.Serialize(new
+            {
+                id = item.RpcId,
+                method = "mining.submit",
+                @params = new object[] { WorkerName, item.JobId, item.En2Hex, item.NTimeHex, item.NonceHex }
+            });
+
+            Send(msg);
+        }
+    }
+
+    private void RestartMiningIfRunning()
+    {
+        if (_mineCts != null && !_mineCts.IsCancellationRequested && _job != null)
+            StartMining();
+    }
+
+    private void MineThread(int tid, int threads, CancellationToken ct)
+    {
+        long local = 0;
+
+        Span<byte> header = stackalloc byte[80];
+        Span<byte> digest = stackalloc byte[32];
+
+        // disjoint nonce scanning: start=tid, step=threads
+        uint nonce = (uint)tid;
+        uint step = (uint)threads;
+
+        while (!ct.IsCancellationRequested)
+        {
+            var job = _job;
+            if (job == null || _extranonce1Bytes.Length == 0 || _extranonce2Size <= 0)
+            {
+                Thread.Sleep(10);
+                continue;
+            }
+
+            string en2Hex = NextExtranonce2Hex();
+            byte[] en2Bytes = Hex.ToBytes(en2Hex);
+
+            Span<byte> merkle = stackalloc byte[32];
+            BuildMerkleRoot(job, _extranonce1Bytes, en2Bytes, merkle);
+
+            BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(0, 4), job.VersionU32);
+            job.PrevHeader32.CopyTo(header.Slice(4, 32));
+            merkle.CopyTo(header.Slice(36, 32));
+            BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(68, 4), job.NTimeU32);
+            BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(72, 4), job.NBitsU32);
+
+            byte[] targetLE = _targetLE;
+
+            while (!ct.IsCancellationRequested)
+            {
+                if (!ReferenceEquals(job, _job)) break;
+
+                BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(76, 4), nonce);
+                BtcHash.DoubleSha256(header, digest);
+
+                local++;
+                _threadCounts[tid] = local;
+
+                if (HashLEQTargetLE(digest, targetLE))
+                {
+                    Span<byte> disp = stackalloc byte[32];
+                    digest.CopyTo(disp);
+                    disp.Reverse();
+
+                    string hashDisp = Hex.FromBytes(disp);
+                    string nonceHex = nonce.ToString("x8");
+
+                    long rpcId = Interlocked.Increment(ref _rpcId);
+
+                    Console.WriteLine("[SUBMIT CHECK]");
+                    Console.WriteLine($"  hash   = {hashDisp}");
+                    Console.WriteLine($"  target = {_targetBEHex}");
+                    Console.WriteLine($"  diff   = {_poolDiff.ToString(CultureInfo.InvariantCulture)}");
+                    Console.WriteLine($"  job    = {job.JobId}");
+                    Console.WriteLine($"  en2    = {en2Hex}");
+                    Console.WriteLine($"  ntime  = {job.NTimeHex}");
+                    Console.WriteLine($"  nonce  = {nonceHex} (submit)");
+
+                    _submitQ?.Writer.TryWrite(new SubmitItem(rpcId, job.JobId, en2Hex, job.NTimeHex, nonceHex, hashDisp));
+                }
+
+                nonce += step;
+            }
+        }
+    }
+
+    private string NextExtranonce2Hex()
+    {
+        long v = Interlocked.Increment(ref _extranonce2Counter);
+        return ((ulong)v).ToString("x").PadLeft(_extranonce2Size * 2, '0');
+    }
+
+    private static void BuildMerkleRoot(MiningJob job, ReadOnlySpan<byte> en1, ReadOnlySpan<byte> en2, Span<byte> out32)
+    {
+        int len = job.Coinbase1Bytes.Length + en1.Length + en2.Length + job.Coinbase2Bytes.Length;
+        byte[] coinbase = new byte[len];
+
+        int off = 0;
+        Buffer.BlockCopy(job.Coinbase1Bytes, 0, coinbase, off, job.Coinbase1Bytes.Length); off += job.Coinbase1Bytes.Length;
+        en1.CopyTo(coinbase.AsSpan(off, en1.Length)); off += en1.Length;
+        en2.CopyTo(coinbase.AsSpan(off, en2.Length)); off += en2.Length;
+        Buffer.BlockCopy(job.Coinbase2Bytes, 0, coinbase, off, job.Coinbase2Bytes.Length);
+
+        Span<byte> h = stackalloc byte[32];
+        BtcHash.DoubleSha256(coinbase, h);
+
+        Span<byte> concat = stackalloc byte[64];
+        foreach (var br in job.MerkleBranches)
+        {
+            h.CopyTo(concat.Slice(0, 32));
+            br.CopyTo(concat.Slice(32, 32));
+            BtcHash.DoubleSha256(concat, h);
+        }
+
+        h.CopyTo(out32);
+    }
+
+    private static bool HashLEQTargetLE(ReadOnlySpan<byte> hashLE32, ReadOnlySpan<byte> targetLE32)
+    {
+        for (int i = 31; i >= 0; i--)
+        {
+            byte h = hashLE32[i];
+            byte t = targetLE32[i];
+            if (h < t) return true;
+            if (h > t) return false;
+        }
+        return true;
+    }
+
+    private static BigInteger TargetFromDifficulty(decimal diff)
+    {
+        if (diff <= 0) return (BigInteger.One << 256) - 1;
+
+        const decimal scaleDec = 100_000_000m;
+        BigInteger scale = new BigInteger(100_000_000);
+        BigInteger diffScaled = new BigInteger((long)(diff * scaleDec));
+        if (diffScaled <= 0) return (BigInteger.One << 256) - 1;
+
+        BigInteger max = (BigInteger.One << 256) - 1;
+        BigInteger t = (Diff1Target * scale) / diffScaled;
+
+        if (t <= 0) return max;
+        return t > max ? max : t;
+    }
+
+    private static byte[] TargetToLE32(BigInteger target)
+    {
+        byte[] le = target.ToByteArray(isUnsigned: true, isBigEndian: false);
+        if (le.Length < 32) { Array.Resize(ref le, 32); return le; }
+        if (le.Length > 32) return le.Take(32).ToArray();
+        return le;
+    }
+
+    private static string TargetToBEHex32(BigInteger target)
+    {
+        byte[] be = target.ToByteArray(isUnsigned: true, isBigEndian: true);
+        if (be.Length < 32)
+        {
+            var padded = new byte[32];
+            Buffer.BlockCopy(be, 0, padded, 32 - be.Length, be.Length);
+            be = padded;
+        }
+        else if (be.Length > 32) be = be[^32..];
+        return Hex.FromBytes(be);
+    }
+
+    private static byte[] MaxTargetLE()
+    {
+        var b = new byte[32];
+        for (int i = 0; i < 32; i++) b[i] = 0xFF;
+        return b;
+    }
+
+    private static string MaxTargetBEHex()
+    {
+        var b = new byte[32];
+        for (int i = 0; i < 32; i++) b[i] = 0xFF;
+        return Hex.FromBytes(b);
+    }
+
+    private static uint ParseUInt32Hex(string hex) =>
+        uint.Parse(hex, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
+
+    private static decimal ParseDecimalLoose(JsonNode? node)
+    {
+        if (node == null) return 0m;
+        try
+        {
+            if (node is JsonValue v)
+            {
+                if (v.TryGetValue<decimal>(out var d)) return d;
+                if (v.TryGetValue<double>(out var dd)) return (decimal)dd;
+                if (v.TryGetValue<long>(out var l)) return l;
+                if (v.TryGetValue<int>(out var i)) return i;
+                if (v.TryGetValue<string>(out var s)) return decimal.Parse(s, CultureInfo.InvariantCulture);
+            }
+        }
+        catch { }
+        return 0m;
+    }
+
+    private static int? TryGetInt(JsonNode? n)
+    {
+        if (n == null) return null;
+        try
+        {
+            if (n is JsonValue v)
+            {
+                if (v.TryGetValue<int>(out var i)) return i;
+                if (v.TryGetValue<string>(out var s) && int.TryParse(s, out var x)) return x;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string? TryGetString(JsonNode? n)
+    {
+        if (n == null) return null;
+        try
+        {
+            if (n is JsonValue v && v.TryGetValue<string>(out var s)) return s;
+        }
+        catch { }
+        return null;
+    }
+
+    private void PrintHashrate()
+    {
+        if (_mineCts == null) return;
+
+        long total = 0;
+        var arr = _threadCounts;
+        for (int i = 0; i < arr.Length; i++) total += Volatile.Read(ref arr[i]);
+
+        var now = DateTime.UtcNow;
+        var secs = (now - _lastPrint).TotalSeconds;
+        if (secs <= 0.0001) return;
+
+        long delta = total - _lastTotal;
+        double hps = delta / secs;
+
+        Console.WriteLine($"[HASHRATE] {hps:N0} H/s  (gesamt: {total:N0})   (acc={_accepted} rej={_rejected})");
+
+        _lastTotal = total;
+        _lastPrint = now;
+    }
+}
+
+static class Program
+{
+    static async Task<int> Main(string[] args)
+    {
+        bool doTest = args.Any(a => a.Equals("--test", StringComparison.OrdinalIgnoreCase));
+        bool doMine = args.Length == 0 || args.Any(a => a.Equals("--mine", StringComparison.OrdinalIgnoreCase));
+
+        if (doTest)
+        {
+            bool ok = OfflineTests.KnownBlock100k();
+            Console.WriteLine("\nTaste drücken zum Beenden .");
+            Console.ReadKey();
+            return ok ? 0 : 1;
+        }
+
+        if (!doMine)
+        {
+            Console.WriteLine("Unbekannter Modus. Nutze:");
+            Console.WriteLine("  --test");
+            Console.WriteLine("  --mine");
+            return 2;
+        }
+
+        // >>> DEINE ZUGANGSDATEN <<<
+        const string host = "public-pool.io";
+        const int port = 3333;
+        const string worker = "bc1q9ccx895m9vzgagszeaw2kexqwrlx5k47ke6m4n.worker";
+        const string password = "x";
+
+        var miner = new StratumMiner();
+        miner.Connect(host, port, worker, password);
+
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        Console.WriteLine("Miner läuft - STRG+C zum Beenden\n");
+        await miner.RunAsync(cts.Token);
+        return 0;
+    }
+}
